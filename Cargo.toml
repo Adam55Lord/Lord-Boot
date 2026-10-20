@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (C) 2026 Adam55Lord
+
+[package]
+name = "lord-boot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Lord Boot: UEFI bootloader for Lord Core. Loads the kernel as an LXF image only (and can run .lxf test programs)"
+license = "MIT OR Apache-2.0"
+authors = ["Adam55Lord"]
+
+[dependencies]
+uefi = { version = "0.41", features = ["alloc", "global_allocator", "panic_handler"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

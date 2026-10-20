@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"          # edition 2024 needs Rust >= 1.85
+targets = ["x86_64-unknown-uefi"]
+profile = "minimal"
