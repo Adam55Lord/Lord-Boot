@@ -44,5 +44,3 @@ Licensed under either of
 
 at your option (`SPDX-License-Identifier: MIT OR Apache-2.0`). Unless you explicitly state otherwise, any contribution
 intentionally submitted for inclusion in Lord Boot by you shall be dual licensed as above, without any additional terms or conditions.
-
-Third-party crates (the `uefi` family from crates.io) and their licenses are listed in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
