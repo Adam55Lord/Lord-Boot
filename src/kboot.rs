@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Adam55Lord
 
-//! Booting an LXF **kernel image** (`FLAG_KERNEL`): the part that makes this a real
-//! bootloader rather than a program runner.
+//! Booting an **LKF kernel image** (Lord Kernel Format, `kernel.lkf`): the part that makes this a
+//! real bootloader rather than a program runner.
 //!
 //! ```text
 //!  while UEFI boot services are alive           after ExitBootServices (no allocator!)
 //!  ------------------------------------         ------------------------------------------
-//!  copy each .kseg segment to physical RAM      convert the UEFI memory map -> MemEntry[]
+//!  copy each mapped LKF section to RAM          convert the UEFI memory map -> MemEntry[]
 //!  find the framebuffer (GOP), RSDP, CPUs       build page tables from the reserved pool:
-//!  reserve: page-table pool, stack, boot info,    kernel segments at their virtual address (W^X)
+//!  reserve: page-table pool, stack, boot info,    kernel sections at load_addr + rva (W^X)
 //!           AP start-up pages                     all RAM at HHDM_OFFSET + phys (RW, NX)
 //!  exit boot services                             framebuffer (write-combining)
 //!                                                 identity map of the hand-off stub only
-//!                                               lordboot_handoff: EFER.NXE, CR0.WP, CR3, GDT, jmp kernel
+//!                                               lordboot_handoff: EFER.NXE, CR0.WP, CR3, GDT, jmp kernel("LORD", info)
 //! ```
 //!
-//! The protocol itself is specified in `src/protocol.rs` (a byte-identical copy lives in the kernel package)
-//! and `docs/19-lxf-boot-protocol.md`.
+//! The image format is `SPEC.md` of lxf_tools (parsed by `src/lxf.rs`); the hand-off protocol is specified in
+//! `src/protocol.rs` (a byte-identical copy lives in the kernel package) and `docs/19-lxf-boot-protocol.md`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -31,7 +31,7 @@ use uefi::table::cfg::ConfigTableEntry;
 use uefi::{println, system};
 
 use crate::loader::LoadError;
-use crate::lxf::{LxfImage, KSEG_R, KSEG_W, KSEG_X};
+use crate::lxf::{LxfImage, Section, BOOT_LORD, KF_FIXED_ADDR, SEC_EXEC, SEC_READ, SEC_RELRO, SEC_WRITE};
 use crate::protocol::{self as proto, CpuEntry, FbInfo, KernelBoot, MemEntry};
 use crate::pt::{Mapper, Perm, Pool, PtError, PAGE};
 
@@ -44,6 +44,10 @@ const STACK_PAGES: u64 = 16; // 64 KiB, the default size for the kernel boot sta
 const MEMMAP_CAP: usize = 1024;
 const MEMMAP_PAGES: u64 = (MEMMAP_CAP * size_of::<MemEntry>()).div_ceil(PAGE as usize) as u64;
 const MAX_CPUS: usize = 256;
+/// Longest kernel command line handed over (bytes, without the NUL); the rest is cut off.
+const CMDLINE_MAX: usize = 1023;
+/// Lowest address a kernel may be linked at (the higher half).
+const KERNEL_MIN_ADDR: u64 = 0xFFFF_8000_0000_0000;
 
 fn kerr(msg: impl Into<String>) -> LoadError {
     LoadError::Kernel(msg.into())
@@ -349,7 +353,7 @@ struct HandoffArgs {
     pml4_phys: u64,   // +0
     stack_top: u64,   // +8   virtual
     entry: u64,       // +16  virtual
-    info: u64,        // +24  virtual, passed in RDI
+    info: u64,        // +24  virtual, passed in RSI (RDI = "LORD")
     gdtr_virt: u64,   // +32  virtual address of the 10-byte GDT pseudo-descriptor
 }
 
@@ -407,7 +411,8 @@ global_asm!(
     "    lidt [rsp]",
     "    add rsp, 16",
     "    xor ebp, ebp",
-    "    mov rdi, r9",
+    "    mov edi, 0x4C4F5244", // boot_magic "LORD" (BOOT_MAGIC of the LKF format)
+    "    mov rsi, r9",         // struct bootinfo * (KernelBoot)
     "    jmp r8",
     ".global lordboot_handoff_end",
     "lordboot_handoff_end:",
@@ -417,31 +422,78 @@ global_asm!(
 // The boot path
 // ---------------------------------------------------------------------------
 
+/// True if a section occupies memory the kernel can use (R, W or X). Sections without any of
+/// these are address-space filler the packer inserts to keep the linked layout; nothing is mapped.
+fn loadable(s: &Section) -> bool {
+    s.mapped() && s.flags & (SEC_READ | SEC_WRITE | SEC_EXEC) != 0
+}
+
+fn section_perm(s: &Section) -> Perm {
+    if s.flags & SEC_EXEC != 0 {
+        Perm::Rx
+    } else if s.flags & SEC_WRITE != 0 && s.flags & SEC_RELRO == 0 {
+        Perm::Rw
+    } else {
+        Perm::R
+    }
+}
+
 /// Loads and starts the kernel. Only returns on error (before boot services end).
 pub fn boot_kernel(img: &LxfImage) -> Result<Infallible, LoadError> {
-    let entry_virt = img.kernel_entry().ok_or_else(|| kerr("kernel has no entry point"))?;
+    let k = img.kernel.as_ref().ok_or_else(|| kerr("not a kernel image (LKF)"))?;
+    if k.boot_proto != BOOT_LORD {
+        return Err(kerr("kernel wants the raw boot protocol; Lord Boot speaks \"lordboot\" only"));
+    }
+    if k.flags & KF_FIXED_ADDR == 0 {
+        return Err(kerr("kernel is not FIXED_ADDR; Lord Boot maps a kernel exactly at its load_addr"));
+    }
+    if !img.imports.is_empty() {
+        return Err(kerr("kernel imports libraries; the bootloader cannot resolve them"));
+    }
+    let base = k.load_addr; // image base: virtual address of RVA 0
+    let span = img.span();
+    if base < KERNEL_MIN_ADDR || base.checked_add(span).is_none() {
+        return Err(kerr("load_addr is not in the higher half"));
+    }
+    let entry_virt = base + u64::from(img.entry_rva);
 
-    // 1. Kernel image in physical memory: segments back to back, each page aligned.
-    let total_pages: u64 = img.segments.iter().map(|s| pages_for(u64::from(s.memsz))).sum();
+    // 1. Kernel image in physical memory: sections back to back, each page aligned. The sections
+    //    keep their RVAs in virtual memory; only their physical placement is packed.
+    let load: Vec<usize> = img.sections.iter().enumerate().filter(|(_, s)| loadable(s)).map(|(i, _)| i).collect();
+    let total_pages: u64 = load.iter().map(|&i| pages_for(u64::from(img.sections[i].virtual_size))).sum();
     let kernel_phys = alloc_pages(AllocateType::AnyPages, MEM_KERNEL, total_pages)?;
-    let mut seg_phys = Vec::with_capacity(img.segments.len());
+    let mut seg_phys: Vec<u64> = Vec::with_capacity(load.len());
     let mut cursor = kernel_phys;
-    for s in &img.segments {
-        let (o, n) = (s.offset as usize, s.filesz as usize);
-        // SAFETY: validated by the parser: o+n <= text.len(); destination inside our allocation.
-        unsafe { core::ptr::copy_nonoverlapping(img.text[o..o + n].as_ptr(), cursor as *mut u8, n) };
+    for &i in &load {
+        let (s, data) = (&img.sections[i], img.section_data(i));
+        // SAFETY: the parser guarantees file_size <= virtual_size; destination inside our allocation.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), cursor as *mut u8, data.len()) };
         seg_phys.push(cursor);
-        cursor += pages_for(u64::from(s.memsz)) * PAGE;
+        cursor += pages_for(u64::from(s.virtual_size)) * PAGE;
     }
-    for (s, p) in img.segments.iter().zip(&seg_phys) {
-        println!("[kboot] segment {:#018x} {}{}{} {:>7} bytes (+{} bss) -> phys {:#x}",
-            s.vaddr,
-            if s.flags & KSEG_R != 0 { 'r' } else { '-' },
-            if s.flags & KSEG_W != 0 { 'w' } else { '-' },
-            if s.flags & KSEG_X != 0 { 'x' } else { '-' },
-            s.filesz, s.memsz - s.filesz, p);
+    // Relocations (a kernel linked at its fixed address normally has none): applied in the physical copy.
+    for r in &img.relocs {
+        let (rva, width, value) = img.reloc_value(r, base).map_err(|e| kerr(alloc::format!("{e}")))?;
+        let (si, off) = img.locate(rva).ok_or_else(|| kerr("relocation outside the image"))?;
+        let at = load.iter().position(|&i| i == si).ok_or_else(|| kerr("relocation in a section that is not loaded"))?;
+        // SAFETY: the parser checked rva + width <= the section's virtual size; the copy is that big.
+        unsafe {
+            let p = (seg_phys[at] + u64::from(off)) as *mut u8;
+            core::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), p, width);
+        }
     }
-    println!("[kboot] entry {entry_virt:#018x}");
+    for (&i, p) in load.iter().zip(&seg_phys) {
+        let s = &img.sections[i];
+        println!("[kboot] {:<8} {:#018x} {}{}{} {:>7} bytes (+{} bss) -> phys {:#x}",
+            s.name,
+            base + u64::from(s.rva),
+            if s.flags & SEC_READ != 0 { 'r' } else { '-' },
+            if s.flags & SEC_WRITE != 0 { 'w' } else { '-' },
+            if s.flags & SEC_EXEC != 0 { 'x' } else { '-' },
+            s.file_size, s.virtual_size - s.file_size, p);
+    }
+    println!("[kboot] load_addr {base:#018x}, entry {entry_virt:#018x}, version {}.{}.{}, kabi {}",
+        k.version >> 16, (k.version >> 8) & 0xff, k.version & 0xff, k.kabi);
 
     // 2. Facts from the firmware.
     let fb = query_framebuffer();
@@ -466,23 +518,31 @@ pub fn boot_kernel(img: &LxfImage) -> Result<Infallible, LoadError> {
         }
         (map.len() as u64, max)
     };
+    // The kernel must not sit inside the direct map the loader is about to build.
+    let hhdm_end = proto::HHDM_OFFSET.saturating_add(max_ram);
+    if base < hhdm_end && base + span > proto::HHDM_OFFSET {
+        return Err(kerr(alloc::format!(
+            "kernel [{base:#x}, {:#x}) overlaps the direct map [{:#x}, {hhdm_end:#x}); link it higher",
+            base + span, proto::HHDM_OFFSET)));
+    }
     let fb_pages = fb.as_ref().map_or(0, |f| pages_for(f.size) + 1);
     let pool_pages = 32
         + 2 * (n_desc + 64)
         + (max_ram >> 30)
         + (total_pages >> 9)
         + (fb_pages >> 9)
-        + 2 * img.segments.len() as u64;
+        + 2 * load.len() as u64;
 
     // 4. Everything that must outlive boot services, as MEM_BOOT (the kernel never frees it).
     let pool_phys = alloc_pages(AllocateType::AnyPages, MEM_BOOT, pool_pages)?;
     let stack_phys = alloc_pages(AllocateType::AnyPages, MEM_BOOT, STACK_PAGES)?;
-    // boot info (1) + memory map + CPU list (1) + GDT/IDT scratch (1)
-    let info_pages = 1 + MEMMAP_PAGES + 1 + 1;
+    // boot info (1) + memory map + CPU list (1) + GDT/IDT scratch (1) + command line (1)
+    let info_pages = 1 + MEMMAP_PAGES + 1 + 1 + 1;
     let info_phys = alloc_pages(AllocateType::AnyPages, MEM_BOOT, info_pages)?;
     let memmap_phys = info_phys + PAGE;
     let cpus_phys = memmap_phys + MEMMAP_PAGES * PAGE;
     let gdt_phys = cpus_phys + PAGE;
+    let cmdline_phys = gdt_phys + PAGE;
 
     // AP start-up: one page below 1 MiB for the trampoline, three below 4 GiB for the AP page
     // tables. Optional: without them the kernel runs on the boot CPU only.
@@ -515,6 +575,12 @@ pub fn boot_kernel(img: &LxfImage) -> Result<Infallible, LoadError> {
         (ptr as *mut u16).write(3 * 8 - 1);
         (ptr.add(2) as *mut u64).write_unaligned(proto::HHDM_OFFSET + gdt_phys);
     }
+
+    // Default command line from the LKF header (NUL terminated, cut off at CMDLINE_MAX).
+    let cmd = k.cmdline.as_bytes();
+    let cmd = &cmd[..cmd.len().min(CMDLINE_MAX)];
+    // SAFETY: cmdline_phys is our zeroed page; cmd.len() < PAGE and the last byte stays NUL.
+    unsafe { core::ptr::copy_nonoverlapping(cmd.as_ptr(), cmdline_phys as *mut u8, cmd.len()) };
 
     // Boot services, watchdog: nothing will pet it from here on.
     let _ = boot::set_watchdog_timer(0, 0x10000, None);
@@ -554,15 +620,11 @@ pub fn boot_kernel(img: &LxfImage) -> Result<Infallible, LoadError> {
         Ok(m) => m,
         Err(e) => pt_fatal(e, "PML4"),
     };
-    // 6a. Kernel segments at the virtual addresses the kernel was linked for.
-    for (s, &p) in img.segments.iter().zip(&seg_phys) {
-        let perm = match (s.flags & KSEG_W != 0, s.flags & KSEG_X != 0) {
-            (_, true) => Perm::Rx,
-            (true, _) => Perm::Rw,
-            _ => Perm::R,
-        };
-        if let Err(e) = m.map_range_4k(s.vaddr, p, pages_for(u64::from(s.memsz)) * PAGE, perm) {
-            pt_fatal(e, "kernel segment");
+    // 6a. Kernel sections at load_addr + rva, the addresses the kernel was linked for.
+    for (&i, &p) in load.iter().zip(&seg_phys) {
+        let s = &img.sections[i];
+        if let Err(e) = m.map_range_4k(base + u64::from(s.rva), p, pages_for(u64::from(s.virtual_size)) * PAGE, section_perm(s)) {
+            pt_fatal(e, "kernel section");
         }
     }
     // 6b. The higher-half direct map.
@@ -624,12 +686,19 @@ pub fn boot_kernel(img: &LxfImage) -> Result<Infallible, LoadError> {
     let v = env!("CARGO_PKG_VERSION").as_bytes();
     ver[..v.len().min(15)].copy_from_slice(&v[..v.len().min(15)]);
 
+    let mem_total: u64 = out[..n].iter().filter(|e| e.kind == proto::kind::USABLE).map(|e| e.length).sum();
+
     // SAFETY: info_phys is our zeroed page, large enough for KernelBoot.
     unsafe {
         (info_phys as *mut KernelBoot).write(KernelBoot {
             magic: proto::MAGIC,
             version: proto::VERSION,
+            cmdline: if cmd.is_empty() { 0 } else { hhdm + cmdline_phys },
+            mem_total,
+            ncpus: cpus.len().max(1) as u32,
+            reserved: 0,
             size: size_of::<KernelBoot>() as u32,
+            ext_version: proto::EXT_VERSION,
             flags,
             hhdm_offset: hhdm,
             pml4_phys,

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Adam55Lord
 
-//! Lord Boot — the UEFI bootloader of Lord Core. It loads the kernel from `\kernel.lxf`
-//! (Lord eXecutable Format, the only kernel format it accepts) on the EFI System Partition
+//! Lord Boot — the UEFI bootloader of Lord Core. It loads the kernel from `\kernel.lkf`
+//! (Lord Kernel Format, the only kernel format it accepts; lxf_tools v3) on the EFI System Partition
 //! and boots it; without a kernel it runs `\hello.lxf` as a UEFI-hosted test program.
 
 #![no_std]
@@ -28,16 +28,16 @@ use loader::Loader;
 
 /// The kernel image this bootloader boots (path relative to the ESP root). If it is
 /// missing the loader falls back to running [`BOOT_PROGRAM`] as a UEFI-hosted program.
-const KERNEL_IMAGE: &str = "kernel.lxf";
+const KERNEL_IMAGE: &str = "kernel.lkf";
 
 /// The program started when there is no kernel image (path relative to the ESP root).
 const BOOT_PROGRAM: &str = "hello.lxf";
 
-/// Console output service handed to LXF programs (`LxfBootInfo.put_str`).
+/// Console output service handed to LXF programs (`LxfBootInfo.put_str`, System V ABI like all LXF code).
 ///
 /// Takes ASCII/UTF-8 bytes, converts to UCS-2 (non-ASCII becomes `?`) and
 /// turns bare `\n` into `\r\n`, which the UEFI text console requires.
-extern "efiapi" fn put_str(ptr: *const u8, len: usize) {
+extern "sysv64" fn put_str(ptr: *const u8, len: usize) {
     if ptr.is_null() {
         return;
     }
@@ -107,10 +107,10 @@ fn run() -> Result<u64, loader::LoadError> {
     if let Some(image) = loader.read_image(KERNEL_IMAGE)? {
         if !image.is_kernel() {
             return Err(loader::LoadError::Kernel(alloc::format!(
-                "{KERNEL_IMAGE} is not a kernel image (FLAG_KERNEL missing); name programs hello.lxf instead"
+                "{KERNEL_IMAGE} is not a kernel image (LKF); name programs hello.lxf instead"
             )));
         }
-        println!("[kboot] {KERNEL_IMAGE}: LXF kernel image, {} segment(s)", image.segments.len());
+        println!("[kboot] {KERNEL_IMAGE}: LKF kernel image, {} section(s)", image.sections.iter().filter(|s| s.mapped()).count());
         kboot::boot_kernel(&image)?;
         unreachable!("boot_kernel only returns on error");
     }

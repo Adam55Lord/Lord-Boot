@@ -1,28 +1,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) 2026 Adam55Lord
 
-//! The **LXF kernel boot protocol**, version 1: what Lord Boot hands to an
-//! LXF kernel image. Specification: `docs/19-lxf-boot-protocol.md`.
+//! The **Lord boot protocol** as Lord Boot speaks it to an **LKF** kernel image (boot protocol
+//! `lordboot` of the Lord kernel format, `SPEC.md` of lxf_tools). Specification of the Lord Core
+//! extension: `docs/19-lxf-boot-protocol.md`.
 //!
 //! This file exists as two byte-identical copies, one per package: the kernel backend
 //! (`src/boot/lord_boot/protocol.rs` in lord-core) and the loader (`src/protocol.rs` in lord-boot).
 //! If you change one, change the other and run `tests/check-protocol-sync.sh`
 //! so the layout cannot drift. Keep it dependency-free `no_std` and `repr(C)`.
 //!
-//! State at the kernel entry point (`extern "C" fn _start(info: *const KernelBoot) -> !`):
-//! * 64-bit mode, interrupts off, `RDI` = `info` (a higher-half-direct-map address),
-//!   a 64 KiB stack in `RSP` (HHDM address), flat GDT, empty IDT.
-//! * Paging on, `EFER.NXE` and `CR0.WP` set. The kernel segments are mapped where
-//!   `.kseg` says (W^X); all RAM-like memory is mapped read/write, no-execute at
-//!   `hhdm_offset + phys`.
+//! State at the kernel entry point (`extern "C" fn _start(boot_magic: u64, info: *const KernelBoot) -> !`,
+//! which is the LKF entry `int kernel_main(u64 boot_magic, struct bootinfo *bi)`):
+//! * 64-bit mode, interrupts off, `RDI` = [`MAGIC`] (`"LORD"`), `RSI` = `info` (a higher-half-direct-map
+//!   address), a 64 KiB stack in `RSP` (HHDM address), flat GDT, empty IDT.
+//! * Paging on, `EFER.NXE` and `CR0.WP` set. The kernel's sections are mapped at
+//!   `load_addr + rva` (W^X, exactly where the LKF header says); all RAM-like memory is mapped
+//!   read/write, no-execute at `hhdm_offset + phys`.
 //! * PML4 slot 0 still holds a transient identity map of the hand-off stub; the
 //!   kernel backend removes it first thing. Every other low-half slot is empty.
 //! * Boot services are gone. Memory the loader used stays reserved
 //!   (`BOOTLOADER_RECLAIMABLE`); nothing frees it.
+//!
+//! `KernelBoot` starts with the generic LKF `struct bootinfo` (the first 32 bytes: `magic`,
+//! `version`, `cmdline`, `mem_total`, `ncpus`), so a kernel that only knows the format's
+//! bootinfo can use it unchanged; everything after `size` is the Lord Core extension.
 #![allow(dead_code)]
 
-pub const MAGIC: u64 = u64::from_le_bytes(*b"LXFKERN\0");
+/// `boot_magic` (RDI) and `KernelBoot::magic`: `"LORD"`, `BOOT_MAGIC` of the LKF format.
+pub const MAGIC: u32 = 0x4C4F_5244;
+/// `KernelBoot::version`: version of the generic LKF `struct bootinfo`.
 pub const VERSION: u32 = 1;
+/// `KernelBoot::ext_version`: version of the Lord Core extension that follows it.
+pub const EXT_VERSION: u32 = 2;
 
 /// Virtual base of the higher-half direct map the bootloader builds.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
@@ -87,10 +97,20 @@ pub struct CpuEntry {
 
 #[repr(C)]
 pub struct KernelBoot {
-    pub magic: u64,
+    // ---- generic LKF `struct bootinfo` (32 bytes) ----
+    pub magic: u32,
     pub version: u32,
+    /// Virtual address of the NUL-terminated kernel command line (0 = none).
+    pub cmdline: u64,
+    /// Bytes of usable RAM.
+    pub mem_total: u64,
+    pub ncpus: u32,
+    pub reserved: u32,
+    // ---- Lord Core extension ----
     /// `size_of::<KernelBoot>()` as the bootloader built it.
     pub size: u32,
+    /// [`EXT_VERSION`].
+    pub ext_version: u32,
     pub flags: u64,
     pub hhdm_offset: u64,
     /// Physical address of the active PML4.
