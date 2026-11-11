@@ -6,12 +6,12 @@ under "What is missing" was searched for and not found. Sizes: **S** days, **M**
 ## 1. What exists
 
 * A UEFI application for **x86-64 only**, installed as `EFI/BOOT/BOOTX64.EFI`.
-* **Kernel mode** (`src/kboot.rs`, `src/pt.rs`): reads `\kernel.lxf` from the volume it was started from, validates it strictly
-  (`src/lxf.rs`), maps the segments with W^X permissions at the addresses the kernel was linked for (`.kseg`), builds a higher-half direct
+* **Kernel mode** (`src/kboot.rs`, `src/pt.rs`): reads `\kernel.lkf` (LKF, lxf_tools v3) from the volume it was started from, validates it strictly
+  (`src/lxf.rs`), maps its sections with W^X permissions at `load_addr + rva`, the addresses the kernel was linked for, builds a higher-half direct
   map, collects the memory map, the GOP framebuffer (the mode the firmware already set), the ACPI RSDP and the CPU list (from the MADT),
-  reserves a page for the AP start-up code, exits boot services and jumps to the kernel (boot protocol v1, `src/protocol.rs`).
-* **Program mode** (`src/loader.rs`): without a `kernel.lxf` it runs `\hello.lxf` as a UEFI-hosted program (relocations, imports,
-  `LibraryMain`); this is a demo/test feature, not part of booting an OS.
+  reserves a page for the AP start-up code, exits boot services and jumps to the kernel with `rdi = "LORD"`, `rsi` = boot info (LKF `lordboot` protocol, Lord Core extension v2, `src/protocol.rs`).
+* **Program mode** (`src/loader.rs`): without a `kernel.lkf` it runs `\hello.lxf` as a UEFI-hosted program (relocations, imports,
+  `libmain`, System V ABI); this is a demo/test feature, not part of booting an OS.
 
 ## 2. What is missing
 
@@ -32,11 +32,12 @@ fallback when the new kernel fails to load or to report "boot OK" (boot counter 
 returning to the firmware.
 
 ### 2.4 Relocatable kernel and KASLR (M-L)
-The kernel is linked at the fixed address `0xFFFFFFFF80000000`; `.kseg` carries absolute virtual addresses and a kernel image has no
-relocations. For KASLR add: a position-independent kernel build, a relocation section in kernel LXF images, a random slide within the top
+The kernel is linked at the fixed address `0xFFFFFFFF80000000` and packed as a `FIXED_ADDR` LKF with `load_addr = 0xFFFFFFFF7FFFF000` (RVA 0 is
+the guard page). The LKF format already has `.reloc` (the loader applies it in `kboot.rs`, ABS64/ABS32/REL32/RVA32), but the kernel build emits none.
+For KASLR add: a position-independent kernel build whose `mkkernel.py` emits `.reloc` and drops `FIXED_ADDR`, a random slide within the top
 2 GiB, and the slide reported in `KernelBoot`. Needs 2.5 (random seed).
 
-### 2.5 More information for the kernel (S-M) — protocol version 2
+### 2.5 More information for the kernel (S-M) — next protocol extension version (3)
 Currently missing from `KernelBoot`:
 * **UEFI runtime services**: the kernel cannot reboot/power off through firmware, read the RTC (`GetTime`) or use NVRAM variables. Add
   `SetVirtualAddressMap` into the direct map and pass the runtime-services pointer, plus the EFI memory map entries marked as runtime.
@@ -51,7 +52,7 @@ Bump `VERSION` in `src/protocol.rs`, keep the layout append-only, update the byt
 support 32-bit pixel formats only as now but report others cleanly; a text-only fallback when no GOP exists (serial only boot).
 
 ### 2.7 Loading from anywhere (M)
-Only the file system of the image's own volume is read (`get_image_file_system`). Add: subdirectories (`\Lord\kernel.lxf`), other partitions
+Only the file system of the image's own volume is read (`get_image_file_system`). Add: subdirectories (`\Lord\kernel.lkf`), other partitions
 and disks (enumerate `SimpleFileSystem` handles, match a partition GUID or label), and later non-FAT file systems if the system partition is
 not FAT (needs own drivers in the loader).
 
@@ -68,7 +69,7 @@ kernel and modules; plus a disk-image builder for QEMU (`mkimage.sh`).
 ### 2.10 Quality: tests and robustness (M)
 The package has no tests. Add host-side unit tests for `lxf.rs` (parser and validator are pure code: run with `cargo test` on the host
 target) including malformed and hostile images, fuzzing of the LXF parser, a test that the page-table builder (`pt.rs`) maps what it should,
-and a QEMU boot test with a deliberately broken `kernel.lxf` (the bootloader must refuse it, not hang). Check memory-map edge cases
+and a QEMU boot test with a deliberately broken `kernel.lkf` (the bootloader must refuse it, not hang). Check memory-map edge cases
 (many entries, `memmap_dropped > 0`).
 
 ### 2.11 Other targets (L, only if wanted)
